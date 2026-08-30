@@ -1,0 +1,250 @@
+name: Torrent Download
+
+on:
+  workflow_dispatch:
+    inputs:
+      magnet:
+        description: 'Magnet or .torrent URL'
+        required: true
+        type: string
+      use_direct_download:
+        description: 'Direct file download'
+        required: false
+        type: boolean
+        default: false
+      imdb_id:
+        description: 'IMDb ID (optional)'
+        required: false
+        type: string
+      torrent_name:
+        description: 'Custom title (optional)'
+        required: false
+        type: string
+
+jobs:
+  download_torrent:
+    name: Download torrent and show progress
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show user input
+        env:
+          TORRENT_URL: ${{ github.event.inputs.magnet }}
+          IMDB_ID: ${{ github.event.inputs.imdb_id }}
+          TORRENT_NAME: ${{ github.event.inputs.torrent_name || github.event.inputs.magnet }}
+          USE_DIRECT_DOWNLOAD: ${{ github.event.inputs.use_direct_download }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          echo "🚀 Torrent download started"
+          echo "Source: ${TORRENT_URL:0:60}..."
+          echo "IMDb ID: ${IMDB_ID:-not provided}"
+          echo "Torrent Name: ${TORRENT_NAME}"
+          echo "Direct download mode: ${USE_DIRECT_DOWNLOAD:-false}"
+          curl -s "https://dweet.cc/dweet/for/torrent-actions-${RUN_ID}?stage=setting_up&percent=0&imdb_id=${IMDB_ID:-}" >/dev/null 2>&1 || true
+
+      - name: Install torrent download tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl qbittorrent-nox python3-venv
+          curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+          echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
+          sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
+
+      - name: Prepare download folder
+        env:
+          IMDB_ID: ${{ github.event.inputs.imdb_id }}
+        run: |
+          OUTPUT_DIR="${IMDB_ID:-download}"
+          mkdir -p "$GITHUB_WORKSPACE/$OUTPUT_DIR"
+          echo "Download folder created: $GITHUB_WORKSPACE/$OUTPUT_DIR"
+
+      - name: Download .torrent file if the input is not a magnet link
+        env:
+          TORRENT_URL: ${{ github.event.inputs.magnet }}
+        run: |
+          if [[ "$TORRENT_URL" == magnet:* ]]; then
+            echo "Magnet link detected. Transmission will add it directly."
+            echo "$TORRENT_URL" > "$RUNNER_TEMP/torrent_source.txt"
+          else
+            echo "Downloading torrent file from URL..."
+            curl -L --fail --retry 5 --retry-delay 2 \
+              --output "$RUNNER_TEMP/input.torrent" \
+              "$TORRENT_URL"
+            ls -lh "$RUNNER_TEMP/input.torrent"
+          fi
+
+      - name: Torrent download with qBittorrent
+        env:
+          TORRENT_URL: ${{ github.event.inputs.magnet }}
+          IMDB_ID: ${{ github.event.inputs.imdb_id }}
+          USE_DIRECT_DOWNLOAD: ${{ github.event.inputs.use_direct_download }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          OUTPUT_DIR="${IMDB_ID:-download}"
+          TARGET_DIR="$GITHUB_WORKSPACE/$OUTPUT_DIR"
+          QBT_PROFILE="$RUNNER_TEMP/qbittorrent-profile"
+          QBT_LOG="$RUNNER_TEMP/qbittorrent.log"
+          QBT_PORT="8080"
+          mkdir -p "$TARGET_DIR" "$QBT_PROFILE"
+          touch "$RUNNER_TEMP/qbt.cookies"
+
+          for port in $(seq 8080 8180); do
+            if ! python3 -c "import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1', $port)); s.close()" >/dev/null 2>&1; then
+              QBT_PORT="$port"
+              break
+            fi
+          done
+
+          if [[ "${USE_DIRECT_DOWNLOAD:-false}" == "true" ]]; then
+            echo "Direct download mode selected."
+            echo "Downloading from direct URL: ${TORRENT_URL:0:80}..."
+            curl -L --fail --retry 5 --retry-delay 2 \
+              --output "$RUNNER_TEMP/direct_download.bin" \
+              "$TORRENT_URL"
+            ls -lh "$RUNNER_TEMP/direct_download.bin"
+            echo "Direct download finished."
+            exit 0
+          fi
+
+          echo "Starting qBittorrent-nox on 127.0.0.1:${QBT_PORT}."
+          printf 'y\n' | qbittorrent-nox --profile="$QBT_PROFILE" --webui-port="$QBT_PORT" >"$QBT_LOG" 2>&1 &
+          QBT_PID=$!
+
+          qbt_password=""
+          qbt_authenticated=false
+          start_timeout=120
+          waited=0
+          while [[ "$waited" -lt "$start_timeout" ]]; do
+            if [[ -z "$qbt_password" ]] && [[ -f "$QBT_LOG" ]]; then
+              qbt_password=$(sed -nE 's/.*temporary password is provided for this session: ([^ ]+).*/\1/p' "$QBT_LOG" | tail -n 1)
+            fi
+            if [[ "$qbt_authenticated" != "true" ]] && [[ -n "$qbt_password" ]] && curl --silent --show-error --fail \
+                --cookie "$RUNNER_TEMP/qbt.cookies" --cookie-jar "$RUNNER_TEMP/qbt.cookies" \
+                --data-urlencode "username=admin" --data-urlencode "password=$qbt_password" \
+                "http://127.0.0.1:${QBT_PORT}/api/v2/auth/login" | grep -q '^Ok\.$'; then
+              qbt_authenticated=true
+              echo "qBittorrent Web API authenticated on 127.0.0.1:${QBT_PORT}."
+              break
+            fi
+            if ! kill -0 "$QBT_PID" 2>/dev/null; then
+              echo "qBittorrent exited before Web API authentication."
+              cat "$QBT_LOG" || true
+              exit 1
+            fi
+            echo -ne "\rWaiting for qBittorrent Web API... ${waited}s / ${start_timeout}s       "
+            sleep 2
+            waited=$((waited + 2))
+          done
+
+          if [[ "$qbt_authenticated" != "true" ]]; then
+            echo "qBittorrent Web API authentication failed."
+            echo "--- qBittorrent log ---"
+            cat "$QBT_LOG" || true
+            exit 1
+          fi
+
+          echo "qBittorrent is ready."
+          echo "qBittorrent WebUI Password: ${qbt_password}"
+
+          # Start cloudflared quick tunnel (no account needed)
+          TUNNEL_LOG="$RUNNER_TEMP/cloudflared.log"
+          cloudflared tunnel --url "http://127.0.0.1:${QBT_PORT}" --no-autoupdate >"$TUNNEL_LOG" 2>&1 &
+          TUNNEL_PID=$!
+
+          # Wait for tunnel URL to appear in log
+          TUNNEL_URL=""
+          for i in $(seq 1 30); do
+            TUNNEL_URL=$(grep -oP 'https://[a-z0-9\-]+\.trycloudflare\.com' "$TUNNEL_LOG" 2>/dev/null | head -1 || true)
+            [[ -n "$TUNNEL_URL" ]] && break
+            sleep 1
+          done
+          echo "Cloudflare tunnel URL: ${TUNNEL_URL:-not established}"
+
+          # Broadcast initial live tunnel info
+          curl -s "https://dweet.cc/dweet/for/torrent-actions-${RUN_ID}?stage=downloading&percent=0&url=${TUNNEL_URL}&pass=${qbt_password}" >/dev/null 2>&1 || true
+
+          if [[ "$TORRENT_URL" == magnet:* ]]; then
+            echo "Adding magnet URL to qBittorrent."
+            curl --silent --show-error --fail \
+              --cookie "$RUNNER_TEMP/qbt.cookies" \
+              --data-urlencode "urls=$TORRENT_URL" \
+              --data-urlencode "savepath=$TARGET_DIR" \
+              "http://127.0.0.1:${QBT_PORT}/api/v2/torrents/add" | grep -q '^Ok\.$'
+          else
+            echo "Downloading .torrent file from URL first..."
+            curl -L --fail --retry 5 --retry-delay 2 \
+              --output "$RUNNER_TEMP/input.torrent" \
+              "$TORRENT_URL"
+            curl --silent --show-error --fail \
+              --cookie "$RUNNER_TEMP/qbt.cookies" \
+              --form "torrents=@$RUNNER_TEMP/input.torrent" \
+              --form "savepath=$TARGET_DIR" \
+              "http://127.0.0.1:${QBT_PORT}/api/v2/torrents/add" | grep -q '^Ok\.$'
+          fi
+
+          waited=0
+          while true; do
+            torrent_info=$(curl --silent --show-error --fail \
+              --cookie "$RUNNER_TEMP/qbt.cookies" \
+              "http://127.0.0.1:${QBT_PORT}/api/v2/torrents/info" || true)
+            status_line=$(python3 -c "import json, sys; items=json.loads(sys.stdin.read() or '[]'); item=items[0] if items else {}; fmt=lambda value: f'{value / (1024 ** 3):.2f} GiB' if value >= 1024 ** 3 else (f'{value / (1024 ** 2):.1f} MiB' if value >= 1024 ** 2 else f'{value / 1024:.1f} KiB'); speed=fmt(item.get('dlspeed', 0)) + '/s'; eta=item.get('eta', 8640000); eta_text='unknown' if eta >= 8640000 else (f'{eta // 3600}h {(eta % 3600) // 60}m' if eta >= 3600 else (f'{eta // 60}m {eta % 60}s' if eta >= 60 else f'{eta}s')); print(f\"{item.get('progress', 0) * 100:.1f}|{fmt(item.get('downloaded', 0))}|{fmt(item.get('total_size', item.get('size', 0)))}|{speed}|{eta_text}|{item.get('num_seeds', 0)}|{item.get('num_leechs', 0)}|{item.get('state', 'waiting')}\")" <<< "$torrent_info")
+            IFS='|' read -r progress downloaded total speed eta seeds peers state <<< "$status_line"
+            echo "qBittorrent: ${progress}% | ${downloaded} / ${total} | ${speed} | ETA ${eta} | seeds ${seeds}, peers ${peers} | ${state}"
+            
+            # Broadcast live progress without git push
+            python3 -c "import urllib.request, urllib.parse; p = {'stage': 'downloading', 'percent': '${progress%%.*}', 'downloaded': '${downloaded}', 'total': '${total}', 'speed': '${speed}', 'eta': '${eta}', 'peers': '${peers}', 'seeds': '${seeds}', 'url': '${TUNNEL_URL}', 'pass': '${qbt_password}'}; urllib.request.urlopen(f'https://dweet.cc/dweet/for/torrent-actions-${RUN_ID}?' + urllib.parse.urlencode(p), timeout=2)" >/dev/null 2>&1 || true
+
+            if python3 -c "import json, sys; items=json.loads(sys.stdin.read() or '[]'); sys.exit(0 if items and items[0].get('progress', 0) >= 1 else 1)" <<< "$torrent_info"; then
+              echo "qBittorrent reports the torrent is complete."
+              break
+            fi
+            sleep 5
+            waited=$((waited + 5))
+          done
+
+          echo "--- qBittorrent final status ---"
+          curl --silent --show-error --fail \
+            --cookie "$RUNNER_TEMP/qbt.cookies" \
+            "http://127.0.0.1:${QBT_PORT}/api/v2/torrents/info" || true
+
+          if find "$TARGET_DIR" -type f -size +0c | grep -q .; then
+            echo "Files downloaded: $(find "$TARGET_DIR" -type f | wc -l)"
+            echo "qBittorrent completed the torrent job."
+            exit 0
+          fi
+
+          echo "qBittorrent is running, but no real payload has transferred yet."
+          echo "This usually means the torrent peer network is blocked by GitHub NAT / public-IP limits."
+          exit 1
+
+      - name: Install Hugging Face upload dependencies
+        run: |
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet requests guessit huggingface_hub pandas sqlalchemy psycopg2-binary
+
+      - name: Push downloaded media to Hugging Face dataset
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+          TORRENT_DIR: ${{ github.workspace }}/${{ github.event.inputs.imdb_id || 'download' }}
+          TORRENT_NAME: ${{ github.event.inputs.torrent_name || github.event.inputs.magnet }}
+          IMDB_ID: ${{ github.event.inputs.imdb_id }}
+          RUN_ID: ${{ github.run_id }}
+          HF_HUB_DISABLE_PROGRESS_BARS: "1"
+          HF_HUB_DISABLE_XET: "1"
+        run: |
+          if [[ -z "${HF_TOKEN:-}" || -z "${HF_REPO_ID:-}" ]]; then
+            echo "Skipping Hugging Face upload because HF_TOKEN or HF_REPO_ID is not configured."
+            exit 0
+          fi
+
+          curl -s "https://dweet.cc/dweet/for/torrent-actions-${RUN_ID}?stage=uploading_hf&percent=100" >/dev/null 2>&1 || true
+          echo "Uploading files to Hugging Face"
+          python scripts/hf_torrent_push.py
+          curl -s "https://dweet.cc/dweet/for/torrent-actions-${RUN_ID}?stage=completed&percent=100" >/dev/null 2>&1 || true
+          echo "✅ Upload complete"

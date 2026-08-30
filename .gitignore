@@ -1,0 +1,18 @@
+*/__pycache__/*
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Android / Gradle generated files
+android/.gradle/
+android/**/build/
+android/local.properties
+android/.idea/
+android/*.iml
+android/**/captures/
+android/**/generated/
+android/**/*.iml
+
+# OS/editor noise
+.DS_Store
