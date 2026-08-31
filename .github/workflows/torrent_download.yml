@@ -45,6 +45,24 @@ jobs:
           echo "Direct download mode: ${USE_DIRECT_DOWNLOAD:-false}"
           curl -s "https://dweet.cc/dweet/for/torrent-actions-${RUN_ID}?stage=setting_up&percent=0&imdb_id=${IMDB_ID:-}" >/dev/null 2>&1 || true
 
+      - name: Maximize runner disk space
+        run: |
+          echo "=== Disk space before cleanup ==="
+          df -h /
+          echo "🧹 Cleaning up pre-installed toolsets to maximize torrent storage..."
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /opt/hostedtoolcache/Java*
+          sudo rm -rf /opt/hostedtoolcache/Ruby*
+          sudo rm -rf /opt/hostedtoolcache/go*
+          sudo docker system prune -af >/dev/null 2>&1 || true
+          sudo apt-get clean || true
+          echo "=== Disk space after cleanup ==="
+          df -h /
+
       - name: Install torrent download tools
         run: |
           sudo apt-get update -qq
