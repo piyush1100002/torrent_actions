@@ -177,7 +177,7 @@ class TorrentListViewModel(
             }
 
             withContext(Dispatchers.Default) {
-                torrentList.run {
+                torrentList.distinctBy(Torrent::hash).run {
                     val comparator = when (torrentSort) {
                         TorrentSort.NAME -> {
                             compareBy(String.CASE_INSENSITIVE_ORDER, Torrent::name)
