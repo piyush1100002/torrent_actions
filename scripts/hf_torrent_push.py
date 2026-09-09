@@ -249,7 +249,7 @@ def upload_single_file(file_path: Path, repo_id: str, token: str, torrent_name: 
     imdb_id = metadata["imdb_id"]
     imdb_key = build_imdb_key(imdb_id, metadata["is_series"], metadata["season"], metadata["episode"])
     if not imdb_key:
-        raise RuntimeError(f"Could not resolve IMDb ID for torrent: {extract_torrent_title(torrent_name)}")
+        print(f"IMDb ID not resolved for {torrent_title or file_path.name}; uploading with blank imdb_id")
     infohash = extract_infohash(torrent_name) or f"hf-{file_path.stem}-{abs(hash(file_path.resolve()))}"
 
     remote_name = f"{infohash}_{file_index}"
