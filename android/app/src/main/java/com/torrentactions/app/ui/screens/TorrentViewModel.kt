@@ -112,7 +112,7 @@ class TorrentViewModel(
     private suspend fun fetchAllWorkersInternal(isBackground: Boolean) {
         val result = repository.fetchAllWorkers()
         if (result.isSuccess) {
-            val all = result.getOrDefault(emptyList())
+            val all = result.getOrDefault(emptyList()).distinctBy { it.runId }
             val active = all.filter { it.isActive }
             val history = all.filter { !it.isActive }
 
